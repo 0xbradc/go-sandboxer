@@ -49,7 +49,7 @@ struct ProcessEntry
     int mode; // Dictated by `status_modes` enum, but this isn't a hard invariant
 };
 
-int main(int argc, char *argv[])
+int main_1(int argc, char *argv[])
 {
     if (argc != 3)
     {
