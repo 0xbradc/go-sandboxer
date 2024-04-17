@@ -132,29 +132,42 @@ func main() {
 				if procTable[int(childPid)] == USER_MODE {
 					procTable[int(childPid)] = KERN_MODE
 
-					// Block `connect` syscalls with certain IP addressess
-					if regs.Orig_rax == syscall.SYS_CONNECT {
-						// Read data at %rsi
-						// `ip_addr` is part of `struct in_addr`, which is part of `struct sockaddr_in`
-						var ip_addr []byte
-						bytesRead, err := syscall.PtracePeekData(int(childPid), uintptr(regs.Rsi+uint64(unsafe.Sizeof(C.sa_family_t(0)))+uint64(unsafe.Sizeof(C.in_port_t(0)))), ip_addr)
-						if err != nil || bytesRead == 0 {
-							fmt.Fprintf(os.Stderr, "Error: `PtracePeekData()` failed: %v\n", err)
-							return
+					switch regs.Orig_rax {
+					case syscall.SYS_CONNECT:
+						{
+							// Block `connect` syscalls with certain IP addressess
+							// `ip_addr` is part of `struct in_addr`, which is part of `struct sockaddr_in`
+							var ip_addr []byte
+							bytesRead, err := syscall.PtracePeekData(int(childPid), uintptr(regs.Rsi+uint64(unsafe.Sizeof(C.sa_family_t(0)))+uint64(unsafe.Sizeof(C.in_port_t(0)))), ip_addr)
+							if err != nil || bytesRead == 0 {
+								fmt.Fprintf(os.Stderr, "Error: `PtracePeekData()` failed: %v\n", err)
+								return
+							}
+
+							ipBuffer := net.ParseIP(string(ip_addr))
+							if ipBuffer == nil {
+								fmt.Fprintf(os.Stderr, "Error: Invalid IP address")
+								return
+							}
+
+							// IP Address is (1) not long enough or (2) not the correct "127.0.0." prefix
+							if len(ipBuffer) < IP_PREFIX_LEN || strings.Compare(IP_PREFIX, ipBuffer[:IP_PREFIX_LEN].String()) != 0 {
+								regs.Orig_rax = math.MaxInt // Set to invalid syscall
+								syscall.PtraceSetRegs(int(childPid), regs)
+								procTable[int(childPid)] = HALTED_SYSCALL_MODE
+							}
 						}
 
-						// Convert `s_addr` to string representation
-						ipBuffer := net.ParseIP(string(ip_addr))
-						if ipBuffer == nil {
-							fmt.Fprintf(os.Stderr, "Error: Invalid IP address")
-							return
-						}
-
-						// IP Address is (1) not long enough or (2) not the correct "127.0.0." prefix
-						if len(ipBuffer) < IP_PREFIX_LEN || strings.Compare(IP_PREFIX, ipBuffer[:IP_PREFIX_LEN].String()) != 0 {
-							regs.Orig_rax = math.MaxInt // Set to invalid syscall
-							syscall.PtraceSetRegs(int(childPid), regs)
-							procTable[int(childPid)] = HALTED_SYSCALL_MODE
+					case syscall.SYS_FORK:
+					case syscall.SYS_VFORK:
+					case syscall.SYS_CLONE:
+						{
+							// Block `fork`, `vfork`, and `clone` syscalls if it will exceed maximum processes
+							if len(procTable) >= MAX_PROCESSES {
+								regs.Orig_rax = math.MaxInt // Set to invalid syscall
+								syscall.PtraceSetRegs(int(childPid), regs)
+								procTable[int(childPid)] = HALTED_SYSCALL_MODE
+							}
 						}
 					}
 				} else if procTable[int(childPid)] == HALTED_SYSCALL_MODE {
