@@ -7,12 +7,7 @@ package main
 
 /*
 #cgo CFLAGS: -g -Wall
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <limits.h>
 #include <sys/user.h>
-#include <sys/syscall.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -20,14 +15,16 @@ package main
 import "C"
 
 import (
-	"errors"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -64,12 +61,17 @@ func main() {
 	}
 
 	// Clone a new process with a new PID namespace
-	childPid, _, _ := syscall.Syscall(syscall.SYS_FORK, 0, 0, 0)
-	if childPid == 0 {
+	childPid, _, err := syscall.Syscall(syscall.SYS_CLONE, 0, 0, 0)
+	if childPid < 0 {
+		fmt.Fprintf(os.Stderr, "Error: `clone` failure: %v\n", err)
+	} else if childPid == 0 {
 		fmt.Println("In child: ", childPid)
 
 		// `exec` call
-		execGuestPython(directoryPath, userID)
+		err := execGuestPython(directoryPath, userID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: `execGuestPython` failure: %v\n", err)
+		}
 	} else {
 		fmt.Println("In parent: ", childPid)
 
@@ -85,7 +87,7 @@ func main() {
 
 		// Wait for the initial `exec` call
 		var status syscall.WaitStatus
-		syscall.Wait4(-1, &status, 0, nil)
+		_, err := syscall.Wait4(-1, &status, 0, nil)
 		if syscall.WaitStatus.Exited(status) {
 			fmt.Fprintf(os.Stderr, "Error: `wait()` failed: %v\n", err)
 			os.Exit(1)
@@ -123,6 +125,7 @@ func main() {
 				regs := &syscall.PtraceRegs{}
 				err := syscall.PtraceGetRegs(int(childPid), regs)
 				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: `PtraceGetRegs()` failed: %v\n", err)
 					return
 				}
 
@@ -130,32 +133,38 @@ func main() {
 					procTable[int(childPid)] = KERN_MODE
 
 					// Block `connect` syscalls with certain IP addressess
-					if regs.Orig_rax == syscall.SYS_connect {
+					if regs.Orig_rax == syscall.SYS_CONNECT {
 						// Read data at %rsi
 						// `ip_addr` is part of `struct in_addr`, which is part of `struct sockaddr_in`
-						ip_addr := syscall.PtracePeekData(int(child_pid), regs.Rsi+sizeof(C.sa_family_t)+sizeof(C.in_port_t), nil)
+						var ip_addr []byte
+						bytesRead, err := syscall.PtracePeekData(int(childPid), uintptr(regs.Rsi+uint64(unsafe.Sizeof(C.sa_family_t(0)))+uint64(unsafe.Sizeof(C.in_port_t(0)))), ip_addr)
+						if err != nil || bytesRead == 0 {
+							fmt.Fprintf(os.Stderr, "Error: `PtracePeekData()` failed: %v\n", err)
+							return
+						}
 
 						// Convert `s_addr` to string representation
-						// char ip_buffer[INET_ADDRSTRLEN];
-						// inet_ntop(AF_INET, &ip_addr, ip_buffer, INET_ADDRSTRLEN);
+						ipBuffer := net.ParseIP(string(ip_addr))
+						if ipBuffer == nil {
+							fmt.Fprintf(os.Stderr, "Error: Invalid IP address")
+							return
+						}
 
-						// // IP Address is (1) not long enough or (2) not the correct "127.0.0." prefix
-						// if ((strlen(ip_buffer) < IP_PREFIX_LEN) || (strncmp(IP_PREFIX, ip_buffer, IP_PREFIX_LEN) != 0))
-						// {
-						// 	regs.orig_rax = -1; // Set to invalid syscall
-						// 	ptrace(PTRACE_SETREGS, child_pid, 0, &regs);
-						// 	proc_table[tab_index].mode = SYSCALL_BLOCKED_MODE;
-						// }
+						// IP Address is (1) not long enough or (2) not the correct "127.0.0." prefix
+						if len(ipBuffer) < IP_PREFIX_LEN || strings.Compare(IP_PREFIX, ipBuffer[:IP_PREFIX_LEN].String()) != 0 {
+							regs.Orig_rax = math.MaxInt // Set to invalid syscall
+							syscall.PtraceSetRegs(int(childPid), regs)
+							procTable[int(childPid)] = HALTED_SYSCALL_MODE
+						}
 					}
 				} else if procTable[int(childPid)] == HALTED_SYSCALL_MODE {
 					procTable[int(childPid)] = USER_MODE // Since this is a syscall exit, we set back to `USER_MODE`
-					regs.Rax = -EPERM                    // Indicates previous operation was not permitted
+					regs.Rax = uint64(syscall.EPERM)     // Indicates previous operation was not permitted
 					syscall.PtraceSetRegs(int(childPid), regs)
 				} else {
 					procTable[int(childPid)] = USER_MODE // Since this is a syscall exit, we set back to `USER_MODE`
 				}
 				signal = 0 // Clear SIGTRAP signal
-
 			} else if status.Stopped() && (status.StopSignal() != syscall.SIGTRAP) {
 				signal = int(status.StopSignal())
 			}
@@ -171,15 +180,25 @@ func strToIntSafe(str string) (int, error) {
 	}
 
 	if placeholder < 0 || placeholder > int64(math.MaxInt64) {
-		return 0, errors.New("provided integer is out of range")
+		return 0, fmt.Errorf("provided integer is out of range")
 	}
 
 	return int(placeholder), nil
 }
 
 func execGuestPython(directoryPath string, userID int) error {
-	if err := os.Chdir(directoryPath); err != nil {
-		return fmt.Errorf("error: `chdir()` failed: %v", err)
+	_, _, errno := syscall.Syscall(syscall.PTRACE_TRACEME, 0, 0, 0)
+	if errno != 0 {
+		return fmt.Errorf("error: PTRACE_TRACEME failed: %s", errno.Error())
+	}
+
+	dir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("error: `os.Getwd()` failed: %v", err)
+	}
+
+	if err := os.Chdir(dir + directoryPath); err != nil {
+		return fmt.Errorf("error: `os.Chdir()` failed: %v", err)
 	}
 
 	if err := syscall.Setuid(userID); err != nil {
